@@ -9,9 +9,10 @@ data/
   subreddits/
     kallmann_syndrome/
       posts.json                   required
-      predictions.json             optional (the "Actual vs. Predicted" chart)
-      comments.json                optional (the Comments view and "View comments" links)
-      test_predictions.csv         source for predictions.json (not read by the page)
+      predictions.csv              optional: model labels (Hand | Model, Agreement, Actual vs. Predicted)
+      post_map.csv                 optional: Post Map coordinates
+      comments.json                optional: the Comments view and "View comments" links
+      test_predictions.csv         source for predictions.csv (not read by the page)
     XXY/                           add the same files here
 ```
 
@@ -22,12 +23,12 @@ The page loads its data with `fetch`, so serve it (`python3 -m http.server`) ins
 
 1. Create the folder `data/subreddits/XXY/`. The folder name must match `name` in step 3 exactly
    (case matters).
-2. Add `posts.json` to it. Add `predictions.json` if you have model predictions, and
-   `comments.json` if you have comments (formats below).
+2. Add `posts.json` to it. Add `predictions.csv`, `post_map.csv` and `comments.json` if you have
+   them (formats below). Sections whose file is missing say "Not available yet."
 3. In `data/subreddits.json`, set `"ready": true` on its entry (or add an entry if it isn't listed):
 
    ```json
-   {"name": "XXY", "display_name": "r/XXY", "ready": true, "predictions": false, "comments": true}
+   {"name": "XXY", "display_name": "r/XXY", "ready": true, "predictions": true, "post_map": true, "comments": false}
    ```
 
    | Field          | Meaning                                                                   |
@@ -35,7 +36,8 @@ The page loads its data with `fetch`, so serve it (`python3 -m http.server`) ins
    | `name`         | Folder name under `data/subreddits/`                                      |
    | `display_name` | Shown in the dropdown, subtitles and the Compare Communities table        |
    | `ready`        | `false` lists it as "(coming soon)" and disabled; `true` loads its files |
-   | `predictions`  | `true` if the folder has `predictions.json`; leave it out or `false` otherwise |
+   | `predictions`  | `true` if the folder has `predictions.csv`; leave it out or `false` otherwise |
+   | `post_map`     | `true` if the folder has `post_map.csv`; leave it out or `false` otherwise |
    | `comments`     | `true` if the folder has `comments.json`; leave it out or `false` otherwise |
 
    The first ready community in the list is the one shown when the page opens.
@@ -77,26 +79,57 @@ Each post:
 | `comments` | no       | Reddit comment count (number). If any post lacks it, the second stat card shows "Test posts" instead of "Comments". |
 | `url`      | no       | Reddit link. Only `https://www.reddit.com/...` links are made clickable.                    |
 
-## predictions.json (optional)
+## predictions.csv (optional)
 
-Set `"predictions": true` on the community in `data/subreddits.json` when you add this file.
-Without it, the "Actual vs. Predicted" section says there are no predictions for that community.
+Model labels, one row per post and model. They feed the Hand | Model toggle, the Agreement
+section (Hand vs. Model), "Show disagreements only" in the posts list, the Post Map's "Model
+label" coloring and the Actual vs. Predicted chart. Set `"predictions": true` on the community
+in `data/subreddits.json` when you add this file.
 
-```json
-{
-  "models": [{"id": "logistic_regression", "name": "Logistic Regression"}, {"id": "linear_svm", "name": "Linear SVM"}],
-  "categories": ["Sharing Info", "Seeking Info", "Asking for Opinions", "Research"],
-  "posts": [
-    ["2016-02-07", "Sharing Info", "Sharing Info", "Sharing Info"]
-  ]
-}
+```csv
+post_id,model,poster_type,post_type,split
+1g7d12t,Logistic Regression,,Asking for Opinions,test
+1g7d12t,Linear SVM,,Seeking Info,test
 ```
 
-| Field        | Meaning                                                                                              |
-|--------------|------------------------------------------------------------------------------------------------------|
-| `models`     | Models in the dropdown. `name` is what's shown.                                                      |
-| `categories` | Bars on the chart, in order                                                                          |
-| `posts`      | One array per test post: `[date, actual category, prediction of model 1, prediction of model 2, ...]`, with predictions in `models` order |
+| Column        | Meaning                                                                                       |
+|---------------|-----------------------------------------------------------------------------------------------|
+| `post_id`     | The post's `id` in `posts.json`. Rows for other ids are skipped.                              |
+| `model`       | Model name as shown in the dropdowns, e.g. `Logistic Regression`                              |
+| `poster_type` | Predicted poster type, using the same names as `who`. Leave empty if the model doesn't predict it. |
+| `post_type`   | Predicted post type, using the same names as `what`. Leave empty if the model doesn't predict it. |
+| `split`       | `oof` for out-of-fold (cross-validated) predictions, `test` for held-out test-set predictions |
+
+Posts without a row keep their hand labels everywhere. A field no row fills in (right now,
+`poster_type`) shows "Not available yet." in the Model view and in Agreement. When a post has
+several hand post types, it agrees with the model if the model picked any of them.
+
+**This file is temporary.** It currently holds the test-set predictions from
+`test_predictions.csv` (105 posts, `split` = `test`), built by `scripts/build_predictions_data.py`.
+It will be replaced by out-of-fold predictions from scikit-learn's `cross_val_predict` covering
+every post (`split` = `oof`), in the same columns. Agreement states which kind it's based on.
+
+## post_map.csv (optional)
+
+2-D coordinates for the Post Map, one row per post. Set `"post_map": true` on the community in
+`data/subreddits.json` when you add this file.
+
+```csv
+post_id,x,y,topic_id,method
+44k46b,-3.428,-2.413,,tfidf-tsne
+```
+
+| Column     | Meaning                                                                                 |
+|------------|-----------------------------------------------------------------------------------------|
+| `post_id`  | The post's `id` in `posts.json`                                                         |
+| `x`, `y`   | Coordinates (any scale; the axes aren't shown)                                          |
+| `topic_id` | BERTopic topic number (`-1` for outliers). Leave empty until topics exist: "Color by: BERTopic topic" stays disabled while every row is empty. |
+| `method`   | How the layout was made, shown under the map: `tfidf-tsne` reads "TF-IDF + t-SNE (temporary)", `sbert-umap` reads "SBERT + UMAP"; other values are shown as written. |
+
+**The current file is temporary.** `scripts/build_post_map.py` made it from each post's title and
+snippet with TF-IDF, TruncatedSVD and t-SNE (`method` = `tfidf-tsne`). It will be replaced by the
+modeling team's SBERT + UMAP coordinates (`method` = `sbert-umap`) with BERTopic topic ids, in
+the same columns.
 
 ## comments.json (optional)
 
@@ -136,15 +169,20 @@ What the Comments view shows:
 
 ## Building the files with the scripts
 
-For r/kallmann_syndrome both files were generated from the health-social-media-viz project's
-`index.html`. If the new community's data comes from the same kind of page, the scripts can
-build them. The last argument is the folder name:
+The last argument is always the folder name under `data/subreddits/`.
 
 ```bash
+# posts.json, from a health-social-media-viz index.html
 python3 scripts/build_posts_data.py /path/to/viz/index.html XXY
-# needs data/subreddits/XXY/test_predictions.csv (columns: text, actual_label, pred_<model>...)
-python3 scripts/build_predictions_data.py /path/to/viz/index.html XXY
+
+# predictions.csv, from data/subreddits/XXY/test_predictions.csv
+# (columns: text, actual_label, pred_<model>...; rows are matched to posts.json by title)
+python3 scripts/build_predictions_data.py XXY
+
+# post_map.csv (temporary TF-IDF + t-SNE layout); needs scikit-learn
+pip install -r scripts/requirements.txt
+python3 scripts/build_post_map.py XXY
 ```
 
-There's no script for `comments.json` yet. Otherwise, write the JSON files in the formats above
-any way you like.
+There's no script for `comments.json` yet. Otherwise, write the files in the formats above any
+way you like.

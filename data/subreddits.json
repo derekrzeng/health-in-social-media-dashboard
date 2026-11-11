@@ -3,7 +3,8 @@
     "name": "kallmann_syndrome",
     "display_name": "r/kallmann_syndrome",
     "ready": true,
-    "predictions": true
+    "predictions": true,
+    "post_map": true
   },
   {
     "name": "XXY",

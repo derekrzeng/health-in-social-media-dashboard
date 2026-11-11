@@ -14,7 +14,9 @@
  * (format: data/README.md), then draws everything for the community picked in the header,
  * for either its posts or its comments (the Posts | Comments toggle):
  * - Stat cards with per-year sparklines
- * - Main chart (posts per month), poster/post type doughnuts, posts list and predictions chart
+ * - Main chart (posts per month), poster/post type doughnuts and posts list, with hand or
+ *   model labels (the Hand | Model toggle)
+ * - Actual vs. Predicted chart, Agreement (hand vs. model) and the Post Map
  * - Compare Communities table (all ready communities side by side)
  *
  * All charts use Chart.js with CoreUI's custom tooltips and color variables.
@@ -69,15 +71,60 @@ const createElement = (tag, className = '', text = '') => {
 
 // ---------------------------------------------------------------------------
 // Data loading: data/subreddits.json lists the communities; each ready one has
-// data/subreddits/<name>/posts.json and, if listed as available, predictions.json and comments.json
+// data/subreddits/<name>/posts.json and, if listed as available, comments.json,
+// predictions.csv and post_map.csv
 // ---------------------------------------------------------------------------
-const fetchJSON = async path => {
+const fetchText = async path => {
   const response = await fetch(path, {cache: 'no-cache'});
   if (!response.ok) {
     throw new Error(`${path} could not be loaded (${response.status} ${response.statusText})`);
   }
-  return response.json();
+  return response.text();
 };
+const fetchJSON = async path => JSON.parse(await fetchText(path));
+
+// CSV with a header row → one object per row, keyed by column name (values trimmed; quotes allowed)
+const parseCSV = text => {
+  const rows = [];
+  let row = [];
+  let field = '';
+  let quoted = false;
+  for (let index = 0; index < text.length; index++) {
+    const char = text[index];
+    if (quoted) {
+      if (char === '"' && text[index + 1] === '"') {
+        field += '"';
+        index++;
+      } else if (char === '"') {
+        quoted = false;
+      } else {
+        field += char;
+      }
+    } else if (char === '"') {
+      quoted = true;
+    } else if (char === ',') {
+      row.push(field);
+      field = '';
+    } else if (char === '\n' || char === '\r') {
+      if (char === '\r' && text[index + 1] === '\n') {
+        index++;
+      }
+      row.push(field);
+      rows.push(row);
+      row = [];
+      field = '';
+    } else {
+      field += char;
+    }
+  }
+  if (field || row.length > 0) {
+    row.push(field);
+    rows.push(row);
+  }
+  const [header = [], ...body] = rows.filter(cells => cells.some(cell => cell.trim() !== ''));
+  return body.map(cells => Object.fromEntries(header.map((name, index) => [name.trim(), (cells[index] ?? '').trim()])));
+};
+const fetchCSV = async path => parseCSV(await fetchText(path));
 
 // Fixed color order, checked for color-vision deficiencies with the dataviz palette validator.
 // A category keeps its color whatever its rank; "Unknown" is always neutral gray.
@@ -94,11 +141,12 @@ const colorsFor = order => {
 
 const loadSubreddit = async subreddit => {
   const folder = `data/subreddits/${encodeURIComponent(subreddit.name)}`;
-  const [postsFile, predictionsFile, commentsFile] = await Promise.all([
+  const [postsFile, predictionRows, commentsFile, mapRows] = await Promise.all([
     fetchJSON(`${folder}/posts.json`),
     // Optional files are only requested when listed, so a community without them doesn't log a 404
-    subreddit.predictions ? fetchJSON(`${folder}/predictions.json`) : null,
-    subreddit.comments ? fetchJSON(`${folder}/comments.json`) : null
+    subreddit.predictions ? fetchCSV(`${folder}/predictions.csv`) : null,
+    subreddit.comments ? fetchJSON(`${folder}/comments.json`) : null,
+    subreddit.post_map ? fetchCSV(`${folder}/post_map.csv`) : null
   ]);
   if (!Array.isArray(postsFile?.posts) || postsFile.posts.length === 0) {
     throw new Error(`${folder}/posts.json has no posts`);
@@ -139,6 +187,33 @@ const loadSubreddit = async subreddit => {
     }
     commentsByPost.get(comment.post_id).push(comment);
   }
+  // Model labels (optional): per model, post id → {who, what, split}. Rows for unknown posts are skipped.
+  const models = unique((predictionRows ?? []).map(row => row.model).filter(Boolean));
+  const modelLabels = new Map(models.map(model => [model, new Map()]));
+  for (const row of predictionRows ?? []) {
+    if (row.model && postsById.has(row.post_id) && (row.poster_type || row.post_type)) {
+      modelLabels.get(row.model).set(row.post_id, {
+        who: row.poster_type || null,
+        what: row.post_type || null,
+        split: row.split?.toLowerCase() === 'oof' ? 'oof' : 'test'
+      });
+    }
+  }
+  // Category orders and colors cover hand and model labels, starting with the posts' own order
+  const labelWhoOrder = unique([...whoOrder, ...[...modelLabels.values()].flatMap(labels => [...labels.values()].map(label => label.who)).filter(Boolean)]);
+  const labelWhatOrder = unique([...whatOrder, ...[...modelLabels.values()].flatMap(labels => [...labels.values()].map(label => label.what)).filter(Boolean)]);
+
+  // Post map (optional): post id → {x, y, topic}; topic is null until BERTopic ids are filled in
+  const mapPoints = new Map();
+  for (const row of mapRows ?? []) {
+    const x = Number.parseFloat(row.x);
+    const y = Number.parseFloat(row.y);
+    if (postsById.has(row.post_id) && Number.isFinite(x) && Number.isFinite(y)) {
+      const topic = row.topic_id === '' || row.topic_id === undefined ? null : Number(row.topic_id);
+      mapPoints.set(row.post_id, {x, y, topic: Number.isFinite(topic) ? topic : null});
+    }
+  }
+
   // Comment labels are optional; orders start with the posts' so a category keeps its color
   const commentWhoOrder = unique([...whoOrder, ...(comments ?? []).map(comment => comment.who).filter(Boolean)]);
   const commentWhatOrder = unique([...whatOrder, ...(comments ?? []).flatMap(comment => comment.what)]);
@@ -151,8 +226,14 @@ const loadSubreddit = async subreddit => {
     end: parseISODate(range.end),
     whoOrder,
     whatOrder,
-    whoColors: colorsFor(whoOrder),
-    whatColors: colorsFor(whatOrder),
+    whoColors: colorsFor(labelWhoOrder),
+    whatColors: colorsFor(labelWhatOrder),
+    labelWhoOrder,
+    labelWhatOrder,
+    models,
+    modelLabels,
+    mapPoints,
+    mapMethod: mapRows?.find(row => row.method)?.method ?? '',
     comments: comments?.length ? comments : null,
     commentsByPost,
     commentsHaveWho: Boolean(comments?.some(comment => comment.who)),
@@ -165,12 +246,7 @@ const loadSubreddit = async subreddit => {
     commentRange: comments?.length ? {
       start: [range.start, comments[0].date].sort()[0],
       end: [range.end, comments.at(-1).date].sort()[1]
-    } : range,
-    predictions: predictionsFile && {
-      models: predictionsFile.models,
-      categories: predictionsFile.categories,
-      posts: predictionsFile.posts.map(([date, actual, ...predicted]) => ({time: parseISODate(date), actual, predicted}))
-    }
+    } : range
   };
 };
 
@@ -228,6 +304,7 @@ const createDateRange = (prefix, onChange) => {
   document.getElementById(`${prefix}-reset`).addEventListener('click', () => bounds && reset());
 
   return {
+    reset: () => bounds && reset(),
     setBounds(range, {keepValues = false} = {}) {
       const previous = bounds;
       bounds = range;
@@ -260,13 +337,39 @@ const items = () => (isComments() ? current.comments : current.posts);
 const itemWord = () => (isComments() ? 'comment' : 'post');
 const modeRange = () => (isComments() ? current.commentRange : current.range);
 
-// Shows a section's content, or its "Not available for comments yet." message
-const setAvailable = (key, available) => {
+// Hand | Model toggle: which labels the type charts and list badges show. Model labels are for
+// posts only, from the model picked in any .model-select (they all stay in sync).
+const NOT_AVAILABLE_YET = 'Not available yet.';
+let labelSource = 'hand';
+let selectedModel = null;
+const useModel = () => labelSource === 'model' && !isComments();
+const modelLabelFor = post => current.modelLabels.get(selectedModel)?.get(post.id) ?? null;
+const modelHas = field => [...(current.modelLabels.get(selectedModel)?.values() ?? [])].some(label => label[field]);
+
+// When a post has several hand post types, it agrees if the model picked any of them
+const handWhatFor = (post, modelWhat) => (modelWhat && post.what.includes(modelWhat) ? modelWhat : post.what[0] ?? null);
+const disagrees = post => {
+  const label = modelLabelFor(post);
+  return Boolean(label && ((label.who && label.who !== post.who) || (label.what && !post.what.includes(label.what))));
+};
+
+// Labels shown for a post: the model's where it has one (Model view), otherwise the hand labels
+const shownWho = post => (useModel() && modelLabelFor(post)?.who) || post.who;
+const shownWhat = post => {
+  const modelWhat = useModel() ? modelLabelFor(post)?.what : null;
+  return modelWhat ? [modelWhat] : post.what;
+};
+
+// Shows a section's content, or its "not available" message
+const setAvailable = (key, available, message = NOT_AVAILABLE) => {
   for (const element of document.querySelectorAll(`[data-mode-content="${key}"]`)) {
     element.classList.toggle('d-none', !available);
   }
   for (const element of document.querySelectorAll(`[data-mode-na="${key}"]`)) {
     element.classList.toggle('d-none', available);
+    if (!available) {
+      element.textContent = message;
+    }
   }
 };
 
@@ -416,7 +519,8 @@ const updateStatCards = () => {
   if (hasCommentData(community)) {
     setStat('stat-second', totalComments(community).toLocaleString('en-US'), 'Comments');
   } else {
-    setStat('stat-second', community.predictions ? community.predictions.posts.length.toLocaleString('en-US') : 'n/a', 'Test posts');
+    const labeled = new Set([...community.modelLabels.values()].flatMap(labels => [...labels.keys()]));
+    setStat('stat-second', labeled.size > 0 ? labeled.size.toLocaleString('en-US') : 'n/a', 'Test posts');
   }
 
   setStat('stat-patient-share', formatPercent(patientShare(community.posts)), 'Patient posters');
@@ -595,38 +699,65 @@ const updateWhatBreakdown = createBreakdown('what');
 const breakdownSubtitle = document.getElementById('breakdown-subtitle');
 const whatNote = document.getElementById('what-note');
 
-// Poster/post type doughnuts for the posts or comments in range. Comments only get a doughnut
-// when they carry that label ("who" / "what"); otherwise it says it's not available.
+// Poster/post type doughnuts for the posts or comments in range, from hand or model labels.
+// Each doughnut says "not available" when its labels are missing: comments without "who" /
+// "what", or a model that doesn't predict that field. In the Model view, only posts the model
+// labeled are counted.
+const breakdownSource = field => {
+  const order = field === 'who' ? 'Who' : 'What';
+  if (isComments()) {
+    const has = field === 'who' ? current.commentsHaveWho : current.commentsHaveWhat;
+    return has && {
+      labelsOf: comment => (field === 'who' ? [comment.who].filter(Boolean) : comment.what),
+      order: current[`comment${order}Order`],
+      colors: current[`comment${order}Colors`]
+    };
+  }
+  if (useModel()) {
+    return modelHas(field) && {
+      labelsOf: post => [modelLabelFor(post)?.[field]].filter(Boolean),
+      order: current[`label${order}Order`],
+      colors: current[`${field}Colors`]
+    };
+  }
+  return {
+    labelsOf: post => (field === 'who' ? [post.who] : post.what),
+    order: current[`${field}Order`],
+    colors: current[`${field}Colors`]
+  };
+};
+
 const updateBreakdowns = (list, from, to) => {
   const word = itemWord();
-  const hasWho = !isComments() || current.commentsHaveWho;
-  const hasWhat = !isComments() || current.commentsHaveWhat;
-  setAvailable('who', hasWho);
-  setAvailable('what', hasWhat);
-
-  const whoCounts = new Map();
-  const whatCounts = new Map();
-  for (const item of list) {
-    if (item.who) {
-      whoCounts.set(item.who, (whoCounts.get(item.who) || 0) + 1);
-    }
-    for (const what of item.what) {
-      whatCounts.set(what, (whatCounts.get(what) || 0) + 1);
-    }
-  }
-  if (hasWho) {
-    updateWhoBreakdown(...(isComments() ? [current.commentWhoOrder, current.commentWhoColors] : [current.whoOrder, current.whoColors]), whoCounts, list.length, word);
-  }
+  const missing = isComments() ? NOT_AVAILABLE : NOT_AVAILABLE_YET;
   whatNote.textContent = '';
-  if (hasWhat) {
-    const labelTotal = updateWhatBreakdown(...(isComments() ? [current.commentWhatOrder, current.commentWhatColors] : [current.whatOrder, current.whatColors]), whatCounts, list.length, word);
+  let counted = useModel() ? 0 : list.length;
+  for (const [field, update] of [['who', updateWhoBreakdown], ['what', updateWhatBreakdown]]) {
+    const source = breakdownSource(field);
+    setAvailable(field, Boolean(source), missing);
+    if (!source) {
+      continue;
+    }
+    const labeled = list.filter(item => source.labelsOf(item).length > 0);
+    const counts = new Map();
+    for (const item of labeled) {
+      for (const label of source.labelsOf(item)) {
+        counts.set(label, (counts.get(label) || 0) + 1);
+      }
+    }
+    const labelTotal = update(source.order, source.colors, counts, labeled.length, word);
+    if (useModel()) {
+      counted = labeled.length;
+    }
     // A few posts have more than one post type, so that doughnut counts labels rather than posts
-    const multiLabel = list.filter(item => item.what.length > 1).length;
-    if (labelTotal > list.length) {
+    if (field === 'what' && labelTotal > labeled.length) {
+      const multiLabel = labeled.filter(item => source.labelsOf(item).length > 1).length;
       whatNote.textContent = `Counts labels, not ${word}s: ${pluralize(multiLabel, word)} ${multiLabel === 1 ? 'has' : 'have'} more than one ${word} type.`;
     }
   }
-  breakdownSubtitle.textContent = `${formatRange(from, to)}, ${pluralize(list.length, word)}`;
+  breakdownSubtitle.textContent = useModel() && selectedModel ?
+    `${formatRange(from, to)}, ${selectedModel} labels for ${counted} of ${pluralize(list.length, word)}` :
+    `${formatRange(from, to)}, ${pluralize(list.length, word)}`;
 };
 
 // ---------------------------------------------------------------------------
@@ -640,6 +771,7 @@ const postsPageInfo = document.getElementById('posts-page-info');
 const postsPagination = document.getElementById('posts-pagination');
 const postsWhoSelect = document.getElementById('posts-who');
 const postsWhatSelect = document.getElementById('posts-what');
+const postsDisagree = document.getElementById('posts-disagree');
 const postsState = {inRange: [], page: 1, expanded: new Set()};
 
 // Refills a filter dropdown with categories under an "All ..." option; no categories disables it
@@ -659,8 +791,14 @@ const updateFilters = () => {
     setFilterOptions(postsWhoSelect, 'All commenter types', current.commentWhoOrder.filter(name => used.has(name)));
     setFilterOptions(postsWhatSelect, 'All comment types', current.commentWhatOrder.filter(name => used.has(name)));
   } else {
-    setFilterOptions(postsWhoSelect, 'All poster types', current.whoOrder);
-    setFilterOptions(postsWhatSelect, 'All post types', current.whatOrder);
+    setFilterOptions(postsWhoSelect, 'All poster types', useModel() ? current.labelWhoOrder : current.whoOrder);
+    setFilterOptions(postsWhatSelect, 'All post types', useModel() ? current.labelWhatOrder : current.whatOrder);
+  }
+  // Disagreements need model labels, which are for posts only
+  const canCompare = !isComments() && Boolean(selectedModel);
+  postsDisagree.disabled = !canCompare;
+  if (!canCompare) {
+    postsDisagree.checked = false;
   }
 };
 
@@ -678,14 +816,36 @@ const linkIfReddit = (element, url) => {
   return element;
 };
 
-const itemMeta = item => {
+const itemMeta = (item, badges = null) => {
   const meta = createElement('div', 'd-flex flex-wrap align-items-center gap-2 small text-body-secondary my-1');
   meta.append(createElement('span', '', formatDate(item.time, SHORT_DATE)));
+  if (badges) {
+    meta.append(...badges);
+    return meta;
+  }
   if (item.who) {
     meta.append(postBadge(item.who, 'primary'));
   }
   meta.append(...item.what.map(what => postBadge(what, 'info')));
   return meta;
+};
+
+// A post's labels from the current source; where hand and model differ, the other one is added
+// as a gray "Hand: ..." / "Model: ..." badge
+const postBadges = post => {
+  const badges = [postBadge(shownWho(post), 'primary'), ...shownWhat(post).map(what => postBadge(what, 'info'))];
+  const label = modelLabelFor(post);
+  if (label) {
+    const other = useModel() ? 'Hand' : 'Model';
+    if (label.who && label.who !== post.who) {
+      badges.push(postBadge(`${other}: ${useModel() ? post.who : label.who}`, 'secondary'));
+    }
+    if (label.what && !post.what.includes(label.what)) {
+      const otherWhats = useModel() ? post.what : [label.what];
+      badges.push(...otherWhats.map(what => postBadge(`${other}: ${what}`, 'secondary')));
+    }
+  }
+  return badges;
 };
 
 // A post's comments as a thread: replies sit under the comment they answer
@@ -724,7 +884,10 @@ const commentThread = post => {
 
 const postItem = post => {
   const item = createElement('li', 'list-group-item py-3');
-  item.append(linkIfReddit(createElement('a', 'post-title', post.title || '(untitled post)'), post.url), itemMeta(post));
+  if (post.id) {
+    item.id = `post-${post.id}`;
+  }
+  item.append(linkIfReddit(createElement('a', 'post-title', post.title || '(untitled post)'), post.url), itemMeta(post, postBadges(post)));
   if (post.snippet) {
     item.append(createElement('p', 'mb-1', post.snippet));
   }
@@ -822,11 +985,21 @@ const renderPagination = pageCount => {
   postsPagination.replaceChildren(...pageItems);
 };
 
-function renderPosts() {
+// Items in range that pass the filters (posts are filtered by the labels they show)
+const listMatches = () => {
   const who = postsWhoSelect.value;
   const what = postsWhatSelect.value;
+  const onlyDisagreements = postsDisagree.checked && !isComments();
+  return postsState.inRange.filter(item => {
+    const itemWho = isComments() ? item.who : shownWho(item);
+    const itemWhat = isComments() ? item.what : shownWhat(item);
+    return (!who || itemWho === who) && (!what || itemWhat.includes(what)) && (!onlyDisagreements || disagrees(item));
+  });
+};
+
+function renderPosts() {
   const word = itemWord();
-  const matches = postsState.inRange.filter(item => (!who || item.who === who) && (!what || item.what.includes(what)));
+  const matches = listMatches();
   const pageCount = Math.max(1, Math.ceil(matches.length / POSTS_PER_PAGE));
   postsState.page = Math.min(Math.max(postsState.page, 1), pageCount);
 
@@ -842,7 +1015,7 @@ function renderPosts() {
   renderPagination(pageCount);
 }
 
-for (const select of [postsWhoSelect, postsWhatSelect]) {
+for (const select of [postsWhoSelect, postsWhatSelect, postsDisagree]) {
   select.addEventListener('change', () => {
     postsState.page = 1;
     renderPosts();
@@ -889,10 +1062,9 @@ const showCommentsNotAvailable = () => {
 };
 
 // ---------------------------------------------------------------------------
-// Predictions chart: actual vs. predicted category counts for the test set
-// (data/subreddits/<name>/predictions.json, built by scripts/build_predictions_data.py)
+// Predictions chart: hand (actual) vs. model (predicted) post type counts for the posts the
+// model labeled (data/subreddits/<name>/predictions.csv, built by scripts/build_predictions_data.py)
 // ---------------------------------------------------------------------------
-const predictionsModelSelect = document.getElementById('predictions-chart-model');
 const predictionsSubtitle = document.getElementById('predictions-chart-subtitle');
 const predictionsControls = document.getElementById('predictions-controls');
 const predictionsContent = document.getElementById('predictions-content');
@@ -956,58 +1128,409 @@ const predictionsChart = new Chart(document.getElementById('predictions-chart'),
 });
 
 let predictionsRange = null;
+
+// Posts the selected model gave a post type, and how its predictions were made
+const predictedPosts = () => current.posts.filter(post => modelLabelFor(post)?.what);
+const splitWord = posts => (posts.every(post => modelLabelFor(post).split === 'test') ? 'test post' : 'post');
+
 const updatePredictionsChart = () => {
-  const {predictions} = current;
-  if (!predictions || !predictionsRange) {
+  if (!predictionsRange || !selectedModel) {
     return;
   }
   const [from, to] = predictionsRange;
-  const modelIndex = Number(predictionsModelSelect.value);
-  const model = predictions.models[modelIndex];
-  const posts = predictions.posts.filter(post => post.time >= from && post.time <= to);
+  const allPredicted = predictedPosts();
+  const pairs = allPredicted
+    .filter(post => post.time >= from && post.time <= to)
+    .map(post => {
+      const predicted = modelLabelFor(post).what;
+      return {actual: handWhatFor(post, predicted), predicted};
+    });
+  // Categories that appear in this model's hand or model labels, in the usual order
+  const present = new Set(allPredicted.flatMap(post => [...post.what, modelLabelFor(post).what]));
+  const categories = current.labelWhatOrder.filter(category => present.has(category));
+  const correct = pairs.filter(pair => pair.actual === pair.predicted).length;
 
-  const actualCounts = predictions.categories.map(category => posts.filter(post => post.actual === category).length);
-  const predictedCounts = predictions.categories.map(category => posts.filter(post => post.predicted[modelIndex] === category).length);
-  const correct = posts.filter(post => post.predicted[modelIndex] === post.actual).length;
-
-  predictionsChart.data.labels = predictions.categories;
-  predictionsChart.data.datasets[0].data = actualCounts;
-  predictionsChart.data.datasets[1].label = `Predicted (${model.name})`;
-  predictionsChart.data.datasets[1].data = predictedCounts;
+  predictionsChart.data.labels = categories;
+  predictionsChart.data.datasets[0].data = categories.map(category => pairs.filter(pair => pair.actual === category).length);
+  predictionsChart.data.datasets[1].label = `Predicted (${selectedModel})`;
+  predictionsChart.data.datasets[1].data = categories.map(category => pairs.filter(pair => pair.predicted === category).length);
   predictionsChart.update();
 
   // Range and post count on one line, the model's accuracy on its own line
-  const accuracy = posts.length === 0 ?
-    'No test posts in this range' :
-    `${model.name}: ${correct} of ${posts.length} correct (${Math.round((100 * correct) / posts.length)}%)`;
+  const accuracy = pairs.length === 0 ?
+    'No labeled posts in this range' :
+    `${selectedModel}: ${correct} of ${pairs.length} correct (${Math.round((100 * correct) / pairs.length)}%)`;
   predictionsSubtitle.replaceChildren(
-    createElement('div', '', `${current.display_name}, ${formatRange(from, to)}, ${pluralize(posts.length, 'test post')}`),
+    createElement('div', '', `${current.display_name}, ${formatRange(from, to)}, ${pluralize(pairs.length, splitWord(allPredicted))}`),
     createElement('div', '', accuracy)
   );
 };
 
-predictionsModelSelect.addEventListener('change', updatePredictionsChart);
 const predictionsDateRange = createDateRange('predictions-chart', (from, to) => {
   predictionsRange = [from, to];
   updatePredictionsChart();
 });
 
-// Predictions are for posts only; keepValues keeps the chosen dates and model (Posts | Comments toggle)
+// Predictions are for posts only; keepValues keeps the chosen dates (toggles and model changes)
 const updatePredictionsSection = ({keepValues = false} = {}) => {
   const community = current;
-  const hasPredictions = !isComments() && Boolean(community.predictions?.posts.length);
+  const hasPredictions = !isComments() && Boolean(selectedModel) && modelHas('what');
   predictionsControls.classList.toggle('d-none', !hasPredictions);
   predictionsContent.classList.toggle('d-none', !hasPredictions);
   predictionsEmpty.classList.toggle('d-none', hasPredictions);
   if (!hasPredictions) {
-    predictionsEmpty.textContent = isComments() ? NOT_AVAILABLE : 'No model predictions for this community yet.';
+    predictionsEmpty.textContent = isComments() ? NOT_AVAILABLE : NOT_AVAILABLE_YET;
     predictionsSubtitle.textContent = community.display_name;
     return;
   }
-  if (!keepValues || predictionsModelSelect.length !== community.predictions.models.length) {
-    predictionsModelSelect.replaceChildren(...community.predictions.models.map((model, index) => new Option(model.name, String(index))));
-  }
   predictionsDateRange.setBounds(community.range, {keepValues});
+};
+
+// ---------------------------------------------------------------------------
+// Agreement (sidebar: Hand vs. Model): how often the selected model matches the hand labels,
+// over every post that has both. Post type and poster type are scored separately.
+// ---------------------------------------------------------------------------
+const agreementSubtitle = document.getElementById('agreement-subtitle');
+const agreementContent = document.getElementById('agreement-content');
+
+const splitText = posts => {
+  const oof = posts.filter(post => modelLabelFor(post).split === 'oof').length;
+  if (oof === posts.length) {
+    return 'out-of-fold (cross-validated) predictions';
+  }
+  return oof === 0 ? 'test-set predictions only' : `${oof} out-of-fold and ${posts.length - oof} test-set predictions`;
+};
+
+// Landis and Koch's wording for kappa values
+const kappaWord = kappa => {
+  if (kappa < 0) {
+    return 'worse than chance';
+  }
+  return ['slight', 'fair', 'moderate', 'substantial', 'almost perfect'][Math.min(4, Math.floor(kappa / 0.2))];
+};
+const formatShare = (part, whole) => (whole === 0 ? 'n/a' : formatPercent(part / whole));
+
+const simpleTable = (headers, rows, className = 'table table-sm mb-0') => {
+  const table = createElement('table', className);
+  const headRow = createElement('tr');
+  headRow.append(...headers.map(([text, cls]) => {
+    const th = createElement('th', cls ?? '', text);
+    th.scope = 'col';
+    return th;
+  }));
+  const thead = createElement('thead');
+  thead.append(headRow);
+  const tbody = createElement('tbody');
+  tbody.append(...rows);
+  table.append(thead, tbody);
+  const wrapper = createElement('div', 'table-responsive');
+  wrapper.append(table);
+  return wrapper;
+};
+
+const agreementBlock = (field, title) => {
+  const block = createElement('div', 'mb-4');
+  block.append(createElement('h5', 'mb-1', title));
+  // [hand, model] for each post with both labels for this field
+  const pairs = current.posts
+    .map(post => ({post, label: modelLabelFor(post)}))
+    .filter(({post, label}) => label?.[field] && (field === 'who' ? post.who : post.what.length > 0))
+    .map(({post, label}) => ({post, hand: field === 'who' ? post.who : handWhatFor(post, label.what), model: label[field]}));
+  if (pairs.length === 0) {
+    block.append(createElement('p', 'text-body-secondary mb-0', NOT_AVAILABLE_YET));
+    return block;
+  }
+
+  const n = pairs.length;
+  const agree = pairs.filter(pair => pair.hand === pair.model).length;
+  const order = field === 'who' ? current.labelWhoOrder : current.labelWhatOrder;
+  const categories = order.filter(category => pairs.some(pair => pair.hand === category || pair.model === category));
+  const handCount = category => pairs.filter(pair => pair.hand === category).length;
+  const modelCount = category => pairs.filter(pair => pair.model === category).length;
+  const both = (hand, model) => pairs.filter(pair => pair.hand === hand && pair.model === model).length;
+
+  // Cohen's kappa: agreement beyond what the two label distributions would give by chance
+  const observed = agree / n;
+  const expected = categories.reduce((sum, category) => sum + ((handCount(category) / n) * (modelCount(category) / n)), 0);
+  const kappa = expected === 1 ? null : (observed - expected) / (1 - expected);
+
+  block.append(createElement('div', 'small text-body-secondary mb-3',
+    `Based on ${pluralize(n, 'post')} with both a hand label and a ${selectedModel} label (${splitText(pairs.map(pair => pair.post))}).`));
+
+  const metrics = createElement('div', 'row g-3 mb-3');
+  for (const [label, value, note] of [
+    ['Agreement', formatPercent(observed), `${agree} of ${n} posts`],
+    ['Cohen\'s kappa', kappa === null ? 'n/a' : kappa.toFixed(2), kappa === null ? '' : `${kappaWord(kappa)} agreement`]
+  ]) {
+    const col = createElement('div', 'col-auto me-4');
+    col.append(createElement('div', 'text-body-secondary small', label), createElement('div', 'fs-4 fw-semibold', value), createElement('div', 'small text-body-secondary', note));
+    metrics.append(col);
+  }
+  block.append(metrics);
+
+  // Precision and recall per category, treating the hand label as correct
+  const scoreRows = categories.map(category => {
+    const tr = createElement('tr');
+    const th = createElement('th', 'fw-normal', category);
+    th.scope = 'row';
+    const hit = both(category, category);
+    tr.append(th,
+      createElement('td', 'text-end', String(handCount(category))),
+      createElement('td', 'text-end', String(modelCount(category))),
+      createElement('td', 'text-end', formatShare(hit, modelCount(category))),
+      createElement('td', 'text-end', formatShare(hit, handCount(category))));
+    return tr;
+  });
+  const row = createElement('div', 'row g-4');
+  const left = createElement('div', 'col-xl-5');
+  left.append(
+    createElement('h6', 'text-body-secondary', 'Precision and Recall'),
+    simpleTable([['Category'], ['Hand', 'text-end'], ['Model', 'text-end'], ['Precision', 'text-end'], ['Recall', 'text-end']], scoreRows),
+    createElement('div', 'small text-body-secondary mt-2', 'Precision: share of the model\'s labels for a category that match the hand label. Recall: share of hand-labeled posts in a category that the model found.')
+  );
+
+  // Confusion matrix: rows are hand labels, columns model labels, shaded by share of the row
+  const matrixRows = categories.map(hand => {
+    const tr = createElement('tr');
+    const th = createElement('th', 'fw-normal text-start', hand);
+    th.scope = 'row';
+    tr.append(th);
+    const rowTotal = handCount(hand);
+    for (const model of categories) {
+      const count = both(hand, model);
+      const share = rowTotal === 0 ? 0 : count / rowTotal;
+      const td = createElement('td', hand === model ? 'fw-semibold' : '', String(count));
+      td.style.backgroundColor = `rgba(var(--cui-primary-rgb), ${(share * 0.85).toFixed(3)})`;
+      td.style.color = share > 0.5 ? '#fff' : '';
+      td.title = `Hand: ${hand}, model: ${model}, ${count} of ${pluralize(rowTotal, 'post')}`;
+      tr.append(td);
+    }
+    return tr;
+  });
+  const right = createElement('div', 'col-xl-7');
+  right.append(
+    createElement('h6', 'text-body-secondary', 'Confusion Matrix'),
+    simpleTable([['Hand \\ Model', 'text-start'], ...categories.map(category => [category])], matrixRows, 'table table-sm table-bordered text-center mb-0'),
+    createElement('div', 'small text-body-secondary mt-2', 'Rows: hand label. Columns: model label. Darker cells hold a larger share of the row.')
+  );
+  row.append(left, right);
+  block.append(row);
+  return block;
+};
+
+const updateAgreement = () => {
+  agreementSubtitle.textContent = current.display_name;
+  if (isComments() || !selectedModel) {
+    setAvailable('agreement', false, isComments() ? NOT_AVAILABLE : NOT_AVAILABLE_YET);
+    return;
+  }
+  setAvailable('agreement', true);
+  agreementSubtitle.textContent = `${current.display_name}, hand labels vs. ${selectedModel}`;
+  agreementContent.replaceChildren(agreementBlock('what', 'Post Type'), agreementBlock('who', 'Poster Type'));
+  agreementContent.lastChild.classList.replace('mb-4', 'mb-0');
+};
+
+// ---------------------------------------------------------------------------
+// Post Map: one point per post from data/subreddits/<name>/post_map.csv (nearby posts have
+// similar text). Clicking a point shows that post in the list.
+// ---------------------------------------------------------------------------
+const MAP_METHODS = {'tfidf-tsne': 'TF-IDF + t-SNE (temporary)', 'sbert-umap': 'SBERT + UMAP'};
+const EXCERPT_LENGTH = 120;
+const mapColorSelect = document.getElementById('post-map-color');
+const mapUnknown = document.getElementById('post-map-unknown');
+const mapSubtitle = document.getElementById('post-map-subtitle');
+const mapNote = document.getElementById('post-map-note');
+
+const hexToRgba = (hex, alpha) => {
+  const value = Number.parseInt(hex.slice(1), 16);
+  return `rgba(${(value >> 16) & 255}, ${(value >> 8) & 255}, ${value & 255}, ${alpha})`;
+};
+const excerpt = post => {
+  const text = [post.title, post.snippet].filter(Boolean).join('. ').replace(/\s+/g, ' ').trim();
+  return text.length > EXCERPT_LENGTH ? `${text.slice(0, EXCERPT_LENGTH - 1).trimEnd()}…` : text;
+};
+
+const mapChart = new Chart(document.getElementById('post-map-chart'), {
+  type: 'scatter',
+  data: {
+    datasets: []
+  },
+  options: {
+    maintainAspectRatio: false,
+    plugins: {
+      legend: {
+        position: 'top',
+        align: 'end',
+        labels: {
+          color: coreui.Utils.getStyle('--cui-body-color'),
+          boxWidth: 10,
+          usePointStyle: true
+        }
+      },
+      tooltip: {
+        mode: 'nearest',
+        intersect: true,
+        callbacks: {
+          // CoreUI's tooltip shows one body line per point, so the date and labels go in the title rows
+          title: items => {
+            const post = items[0]?.raw.post;
+            if (!post) {
+              return [];
+            }
+            const lines = [formatDate(post.time, SHORT_DATE), `Hand: ${[post.who, ...post.what].join(', ')}`];
+            const label = modelLabelFor(post);
+            if (label) {
+              lines.push(`${selectedModel}: ${[label.who, label.what].filter(Boolean).join(', ')}`);
+            }
+            const point = current.mapPoints.get(post.id);
+            if (point?.topic !== null && point?.topic !== undefined) {
+              lines.push(point.topic === -1 ? 'Topic: outlier' : `Topic ${point.topic}`);
+            }
+            return lines;
+          },
+          label: context => excerpt(context.raw.post)
+        }
+      }
+    },
+    scales: {
+      x: {
+        display: false
+      },
+      y: {
+        display: false
+      }
+    },
+    onClick: (event, elements) => {
+      if (elements.length > 0) {
+        const {datasetIndex, index} = elements[0];
+        goToPost(mapChart.data.datasets[datasetIndex].data[index].post);
+      }
+    },
+    onHover: (event, elements) => {
+      event.native.target.style.cursor = elements.length > 0 ? 'pointer' : 'default';
+    }
+  }
+});
+
+// Category (legend entry) of a post for each "Color by" choice, with the legend order and colors
+const mapColoring = colorBy => {
+  if (colorBy === 'model') {
+    return {
+      categoryOf: post => modelLabelFor(post)?.what ?? 'No model label',
+      order: [...current.labelWhatOrder, 'No model label'],
+      colorOf: category => current.whatColors.get(category) ?? NEUTRAL_COLOR
+    };
+  }
+  if (colorBy === 'who') {
+    return {categoryOf: post => post.who, order: current.labelWhoOrder, colorOf: category => current.whoColors.get(category) ?? NEUTRAL_COLOR};
+  }
+  if (colorBy === 'topic') {
+    const topicName = topic => (topic === null ? 'No topic' : (topic === -1 ? 'Outliers' : `Topic ${topic}`));
+    const topics = unique([...current.mapPoints.values()].map(point => point.topic)).sort((a, b) => (a ?? 1e9) - (b ?? 1e9));
+    const colors = new Map();
+    let slot = 0;
+    for (const topic of topics) {
+      colors.set(topicName(topic), topic === null || topic === -1 ? NEUTRAL_COLOR : CATEGORY_COLORS[slot++ % CATEGORY_COLORS.length]);
+    }
+    return {categoryOf: post => topicName(current.mapPoints.get(post.id).topic), order: topics.map(topicName), colorOf: category => colors.get(category)};
+  }
+  // Hand post type (a post with several counts under its first one)
+  return {
+    categoryOf: post => post.what[0] ?? 'No label',
+    order: [...current.labelWhatOrder, 'No label'],
+    colorOf: category => current.whatColors.get(category) ?? NEUTRAL_COLOR
+  };
+};
+
+const updatePostMap = () => {
+  mapSubtitle.textContent = current.display_name;
+  if (isComments() || current.mapPoints.size === 0) {
+    setAvailable('map', false, isComments() ? NOT_AVAILABLE : NOT_AVAILABLE_YET);
+    return;
+  }
+  setAvailable('map', true);
+
+  // Options without data stay listed but disabled
+  const hasTopics = [...current.mapPoints.values()].some(point => point.topic !== null);
+  const modelOption = mapColorSelect.querySelector('option[value="model"]');
+  modelOption.disabled = !selectedModel || !modelHas('what');
+  modelOption.textContent = selectedModel ? `Model label (${selectedModel})` : 'Model label';
+  mapColorSelect.querySelector('option[value="topic"]').disabled = !hasTopics;
+  if (mapColorSelect.selectedOptions[0]?.disabled) {
+    mapColorSelect.value = 'hand';
+  }
+
+  const points = current.posts
+    .filter(post => current.mapPoints.has(post.id))
+    .map(post => ({x: current.mapPoints.get(post.id).x, y: current.mapPoints.get(post.id).y, post}));
+  const {categoryOf, order, colorOf} = mapColoring(mapColorSelect.value);
+  const highlight = mapUnknown.checked;
+  const isHighlighted = post => highlight && post.who === 'Unknown';
+
+  const datasets = order.map(category => ({
+    label: category,
+    data: points.filter(point => categoryOf(point.post) === category && !isHighlighted(point.post)),
+    backgroundColor: hexToRgba(colorOf(category), highlight ? 0.2 : 0.75),
+    borderColor: 'transparent',
+    pointRadius: 3,
+    pointHoverRadius: 5,
+    order: 1
+  })).filter(dataset => dataset.data.length > 0);
+  if (highlight) {
+    const unknown = points.filter(point => isHighlighted(point.post));
+    // Drawn on top (lower order) with a dark outline
+    datasets.push({
+      label: `Unknown poster type (${unknown.length})`,
+      data: unknown,
+      backgroundColor: unknown.map(point => colorOf(categoryOf(point.post))),
+      borderColor: coreui.Utils.getStyle('--cui-body-color'),
+      borderWidth: 1.5,
+      pointRadius: 5,
+      pointHoverRadius: 7,
+      order: 0
+    });
+  }
+  mapChart.data.datasets = datasets;
+  mapChart.update();
+
+  mapSubtitle.textContent = `${current.display_name}, ${points.length} of ${pluralize(current.posts.length, 'post')} placed`;
+  const method = MAP_METHODS[current.mapMethod] ?? (current.mapMethod || 'unknown method');
+  mapNote.textContent = `Layout: ${method}. Nearby points have similar text; the axes have no units. Click a point to see the post in the list.`;
+};
+
+for (const control of [mapColorSelect, mapUnknown]) {
+  control.addEventListener('change', () => current && updatePostMap());
+}
+
+// Shows a post in the list: widens the date range and clears filters if they hide it, then
+// opens its page and scrolls to it
+const goToPost = post => {
+  if (isComments()) {
+    return;
+  }
+  if (!postsState.inRange.includes(post)) {
+    mainRange.reset();
+  }
+  if (!listMatches().includes(post)) {
+    postsWhoSelect.value = '';
+    postsWhatSelect.value = '';
+    postsDisagree.checked = false;
+  }
+  const index = listMatches().indexOf(post);
+  if (index < 0) {
+    return;
+  }
+  postsState.page = Math.floor(index / POSTS_PER_PAGE) + 1;
+  renderPosts();
+  const element = document.getElementById(`post-${post.id}`);
+  if (!element) {
+    return;
+  }
+  const smooth = window.matchMedia('(prefers-reduced-motion: no-preference)').matches;
+  element.scrollIntoView({behavior: smooth ? 'smooth' : 'auto', block: 'center'});
+  element.querySelector('a')?.focus({preventScroll: true});
+  element.classList.add('list-group-item-primary');
+  setTimeout(() => element.classList.remove('list-group-item-primary'), 2500);
 };
 
 // ---------------------------------------------------------------------------
@@ -1097,8 +1620,25 @@ const showLoadErrors = messages => {
 
 // Redraws everything for the current community and mode. keepValues keeps the chosen date
 // ranges (used when only the Posts | Comments toggle changed).
+// Model dropdowns (header, Actual vs. Predicted, Agreement) all show the same model. The header
+// one only shows in the Model view; Hand | Model is for posts, so it's disabled for comments.
+const modelSelects = [...document.querySelectorAll('.model-select')];
+const labelRadios = [...document.querySelectorAll('input[name="label-source"]')];
+const updateModelControls = () => {
+  for (const select of modelSelects) {
+    select.replaceChildren(...current.models.map(model => new Option(model, model)));
+    select.value = selectedModel ?? '';
+    select.disabled = current.models.length === 0;
+  }
+  document.getElementById('header-model').classList.toggle('d-none', !useModel() || current.models.length === 0);
+  for (const radio of labelRadios) {
+    radio.disabled = isComments();
+  }
+};
+
 const render = ({keepValues = false} = {}) => {
   applyModeText();
+  updateModelControls();
   updateStatCards();
   postsState.expanded.clear();
   updateFilters();
@@ -1109,14 +1649,34 @@ const render = ({keepValues = false} = {}) => {
     showCommentsNotAvailable();
   }
   updatePredictionsSection({keepValues});
+  updateAgreement();
+  updatePostMap();
 };
 
 const showSubreddit = name => {
   current = loaded.get(name);
+  // Keep the chosen model if this community has it too
+  selectedModel = current.models.includes(selectedModel) ? selectedModel : current.models[0] ?? null;
   render();
 };
 
 subredditSelect.addEventListener('change', () => showSubreddit(subredditSelect.value));
+
+for (const select of modelSelects) {
+  select.addEventListener('change', () => {
+    selectedModel = select.value;
+    render({keepValues: true});
+  });
+}
+
+for (const radio of labelRadios) {
+  radio.addEventListener('change', () => {
+    labelSource = radio.value;
+    if (current) {
+      render({keepValues: true});
+    }
+  });
+}
 
 for (const radio of document.querySelectorAll('input[name="view-mode"]')) {
   radio.addEventListener('change', () => {
@@ -1178,6 +1738,7 @@ const init = async () => {
   subredditSelect.value = communities[0].name;
   // The browser may restore the toggle after a reload, so start from whichever button is checked
   mode = document.querySelector('input[name="view-mode"]:checked')?.value ?? 'posts';
+  labelSource = document.querySelector('input[name="label-source"]:checked')?.value ?? 'hand';
   showSubreddit(communities[0].name);
   highlightCurrentSection();
 };

@@ -130,6 +130,18 @@
               </a>
             </li>
             <li class="nav-item">
+              <a class="nav-link" href="#agreement" data-section-link>
+                <span class="nav-icon"><span class="nav-icon-bullet"></span></span>
+                Hand vs. Model
+              </a>
+            </li>
+            <li class="nav-item">
+              <a class="nav-link" href="#post-map" data-section-link>
+                <span class="nav-icon"><span class="nav-icon-bullet"></span></span>
+                Post Map
+              </a>
+            </li>
+            <li class="nav-item">
               <a class="nav-link" href="#compare" data-section-link>
                 <span class="nav-icon"><span class="nav-icon-bullet"></span></span>
                 Compare Communities
@@ -769,6 +781,14 @@
                   <input class="btn-check" type="radio" name="view-mode" id="mode-comments" value="comments" autocomplete="off">
                   <label class="btn btn-outline-primary" for="mode-comments">Comments</label>
                 </div>
+                <div class="btn-group" role="group" aria-label="Show hand or model labels">
+                  <input class="btn-check" type="radio" name="label-source" id="labels-hand" value="hand" autocomplete="off" checked>
+                  <label class="btn btn-outline-primary" for="labels-hand">Hand</label>
+                  <input class="btn-check" type="radio" name="label-source" id="labels-model" value="model" autocomplete="off">
+                  <label class="btn btn-outline-primary" for="labels-model">Model</label>
+                </div>
+                <label class="visually-hidden" for="header-model">Model</label>
+                <select class="form-select model-select d-none" id="header-model" style="width: auto"></select>
                 <label class="visually-hidden" for="subreddit-select">Community</label>
                 <select class="form-select" id="subreddit-select" style="width: auto" disabled>
                   <option>Loading...</option>
@@ -903,6 +923,10 @@
                 <select class="form-select form-select-sm" id="posts-what" style="width: auto">
                   <option value="">All post types</option>
                 </select>
+                <div class="form-check d-flex align-items-center gap-2 mb-0 ms-1">
+                  <input class="form-check-input mt-0" type="checkbox" id="posts-disagree">
+                  <label class="form-check-label small" for="posts-disagree">Show disagreements only</label>
+                </div>
               </div>
             </div>
             <ul class="list-group list-group-flush" id="posts-list" aria-live="polite"></ul>
@@ -923,7 +947,7 @@
                 </div>
                 <div class="d-flex flex-wrap align-items-center gap-2" role="toolbar" aria-label="Prediction chart controls" id="predictions-controls">
                   <label class="visually-hidden" for="predictions-chart-model">Model</label>
-                  <select class="form-select" id="predictions-chart-model" style="width: auto"></select>
+                  <select class="form-select model-select" id="predictions-chart-model" style="width: auto"></select>
                   <div class="d-flex align-items-center gap-2">
                     <label class="visually-hidden" for="predictions-chart-from">From</label>
                     <input class="form-control" id="predictions-chart-from" type="date" style="width: auto">
@@ -941,6 +965,56 @@
                 </div>
               </div>
               <p class="text-body-secondary mt-3 mb-0 d-none" id="predictions-empty">No model predictions for this community yet.</p>
+            </div>
+          </div>
+          <!-- /.card-->
+          <div class="card mb-4 dashboard-section" id="agreement">
+            <div class="card-body">
+              <div class="d-flex flex-wrap justify-content-between align-items-start gap-3">
+                <div>
+                  <h4 class="card-title mb-0">Agreement</h4>
+                  <div class="small text-body-secondary" id="agreement-subtitle"></div>
+                </div>
+                <div data-mode-content="agreement">
+                  <label class="visually-hidden" for="agreement-model">Model</label>
+                  <select class="form-select model-select" id="agreement-model" style="width: auto"></select>
+                </div>
+              </div>
+              <div class="mt-3" id="agreement-content" data-mode-content="agreement"></div>
+              <p class="text-body-secondary mt-3 mb-0 d-none" data-mode-na="agreement">Not available yet.</p>
+            </div>
+          </div>
+          <!-- /.card-->
+          <div class="card mb-4 dashboard-section" id="post-map">
+            <div class="card-body">
+              <div class="d-flex flex-wrap justify-content-between align-items-start gap-3">
+                <div>
+                  <h4 class="card-title mb-0">Post Map</h4>
+                  <div class="small text-body-secondary" id="post-map-subtitle"></div>
+                </div>
+                <div class="d-flex flex-wrap align-items-center gap-3" data-mode-content="map">
+                  <div class="d-flex align-items-center gap-2">
+                    <label class="text-body-secondary text-nowrap" for="post-map-color">Color by</label>
+                    <select class="form-select" id="post-map-color" style="width: auto">
+                      <option value="hand">Hand label</option>
+                      <option value="model">Model label</option>
+                      <option value="who">Poster type</option>
+                      <option value="topic">BERTopic topic</option>
+                    </select>
+                  </div>
+                  <div class="form-check mb-0">
+                    <input class="form-check-input" type="checkbox" id="post-map-unknown">
+                    <label class="form-check-label" for="post-map-unknown">Highlight Unknown posts</label>
+                  </div>
+                </div>
+              </div>
+              <div data-mode-content="map">
+                <div class="c-chart-wrapper" style="height: 480px; margin-top: 20px">
+                  <canvas class="chart" id="post-map-chart" height="480" aria-label="Map of posts, nearby posts have similar text" role="img"></canvas>
+                </div>
+                <div class="small text-body-secondary mt-2" id="post-map-note"></div>
+              </div>
+              <p class="text-body-secondary mt-3 mb-0 d-none" data-mode-na="map">Not available yet.</p>
             </div>
           </div>
           <!-- /.card-->
